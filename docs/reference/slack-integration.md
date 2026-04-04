@@ -87,7 +87,7 @@ The manifest ([`extensions/slack/openclaw.plugin.json`](https://github.com/openc
 
 ## Channel Plugin Contract
 
-Slack is a **chat channel plugin** -- the most full-featured plugin type in the OpenClaw plugin system. It implements the [`ChannelPlugin<ResolvedAccount, Probe>`](https://github.com/openclaw/openclaw/blob/4b993ba/src/channels/plugins/types.plugin.ts#L82) contract, which is a composition of ~25 adapter slots. The Slack plugin fills virtually all of them.
+Slack is a **chat channel plugin** -- one of 22 channel plugins in the OpenClaw plugin system. It implements the [`ChannelPlugin<ResolvedAccount, Probe>`](https://github.com/openclaw/openclaw/blob/4b993ba/src/channels/plugins/types.plugin.ts#L82) contract, which is a composition of ~30 adapter slots. The Slack plugin fills 24 of them, putting it in the top tier alongside Discord (25) and Telegram (25).
 
 > **Contract definition files:**
 > [`types.plugin.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/src/channels/plugins/types.plugin.ts#L82) (top-level shape) |
@@ -184,19 +184,51 @@ When the plugin is loaded, registration happens in three phases (via [`defineCha
 
 In `cli-metadata` mode (used for CLI help/completions), only `registerCliMetadata` runs -- the full plugin is not loaded.
 
-### How Slack Differs from Other Channel Plugins
+### Comparison with Other Channel Plugins
 
-Compared to simpler channels (e.g., a webhook-only channel), the Slack plugin is notably complex because:
+The table below compares the top channel plugins by production source size (non-test `.ts` files) and adapter slot coverage:
 
-- **Multi-account support**: Most adapters accept an `accountId` parameter and resolve per-account config. The account model supports independent tokens, allowlists, policies, and enable/disable state per workspace.
-- **Dual connection mode**: Both Socket Mode (persistent WebSocket via Bolt) and HTTP (webhook receiver) are supported, selected per-account.
-- **Rich threading model**: Three `replyToMode` options (`off`/`first`/`all`), thread-scoped sessions, parent session inheritance, and thread participation tracking for implicit mentions.
-- **Native streaming**: Uses Slack's `ChatStreamer` API alongside a legacy draft-stream fallback, with DM-specific optimizations.
-- **Interactive replies**: Inline directive parsing (`[[slack_buttons:...]]`) compiled into Block Kit, plus auto-detection of `Options:` lines.
-- **Exec approvals**: Full native approval delivery via both origin channel and approver DMs.
-- **Status reaction lifecycle**: Multi-stage emoji lifecycle (queued -> thinking -> tool -> done/error) with configurable timing.
-- **Block Kit**: Tables, interactive blocks, and arbitrary block passthrough -- three rendering pipelines merged per reply.
-- **Assistants API**: Uses `assistant.threads.setStatus` for typing indicators.
+| Channel | Prod files | Prod LOC | Adapter slots filled |
+|---|---|---|---|
+| Discord | 183 | 36,456 | 25 |
+| Matrix | 173 | 28,902 | 20 |
+| Telegram | 160 | 27,434 | 25 |
+| Feishu | 100 | 20,063 | 18 |
+| **Slack** | **132** | **16,877** | **24** |
+| MS Teams | 85 | 12,507 | 19 |
+| QQBot | 40 | 11,885 | 8 |
+| WhatsApp | 123 | 10,490 | 23 |
+| BlueBubbles | 58 | 9,557 | 15 |
+| Mattermost | 51 | 8,915 | 17 |
+| LINE | 56 | 8,370 | 13 |
+| Signal | 48 | 5,059 | 17 |
+| iMessage | 51 | 4,472 | 17 |
+
+The following table compares advanced feature support across the top channels. These are platform-specific capabilities beyond the basic send/receive/react contract:
+
+| Feature | Slack | Discord | Telegram | Matrix | MS Teams | WhatsApp |
+|---|---|---|---|---|---|---|
+| **Native streaming** (platform API) | Yes (ChatStreamer) | -- | -- | -- | -- | -- |
+| **Draft/preview streaming** (edit loop) | Yes (7 files) | Yes (8 files) | Yes (12 files) | Yes (2 files) | Yes (1 file) | -- |
+| **Interactive replies** (buttons/selects) | Yes (8 files) | Yes (2 files) | Yes (1 file) | -- | -- | -- |
+| **Block Kit / structured blocks** | Yes (6 files) | -- | -- | -- | -- | -- |
+| **Assistants API** (thread status) | Yes | -- | -- | -- | -- | -- |
+| **Status reaction lifecycle** | Yes | Yes | Yes | -- | -- | -- |
+| **Native exec approvals** | Yes | Yes | Yes | Yes | -- | -- |
+| **Multi-account support** | Yes | Yes | Yes | -- | -- | Yes |
+| **Dual connection mode** (socket + HTTP) | Yes | -- | -- | -- | -- | -- |
+
+**Slack's unique features** among all channel plugins:
+- **Native streaming** via Slack's `ChatStreamer` API (`chat.startStream` / `appendStream` / `stopStream`) -- no other channel has a platform-provided streaming API
+- **Assistants API integration** (`assistant.threads.setStatus`) for typing indicators
+- **Block Kit rendering** -- three separate pipelines (tables, interactive blocks, arbitrary block passthrough) merged per reply
+- **Dual connection mode** -- both Socket Mode and HTTP webhook receiver, selectable per account
+- **Interactive reply directives** with the richest syntax (`[[slack_buttons:...]]`, `[[slack_select:...]]`, auto-detected `Options:` lines)
+
+**Where Discord and Telegram exceed Slack:**
+- **Production codebase size**: Discord (36K LOC) and Telegram (27K LOC) are substantially larger than Slack (17K LOC), primarily due to more complex gateway/bot lifecycle code, richer embed/formatting systems, and Discord's voice/forum channel support
+- **Adapter slot count**: Discord and Telegram each fill 25 slots vs. Slack's 24 (both implement the `elevated` adapter which Slack does not)
+- **Draft streaming depth**: Telegram has the most files (12) dedicated to draft/preview streaming, with sophisticated edit-based preview UX
 
 ---
 
