@@ -20,8 +20,9 @@ This document describes every aspect of how OpenClaw interacts with Slack: from 
 ## Table of Contents
 
 1. [Plugin Architecture](#plugin-architecture)
-2. [Connection Modes](#connection-modes)
-3. [Inbound Pipeline](#inbound-pipeline)
+2. [Channel Plugin Contract](#channel-plugin-contract)
+3. [Connection Modes](#connection-modes)
+4. [Inbound Pipeline](#inbound-pipeline)
    - [Event Registration](#event-registration)
    - [Deduplication and Race Handling](#deduplication-and-race-handling)
    - [Debouncing](#debouncing)
@@ -30,39 +31,40 @@ This document describes every aspect of how OpenClaw interacts with Slack: from 
    - [Content Resolution](#content-resolution)
    - [Thread Context Assembly](#thread-context-assembly)
    - [Context Payload Assembly](#context-payload-assembly)
-4. [Session and Threading Model](#session-and-threading-model)
-5. [Agent Prompt Composition](#agent-prompt-composition)
+5. [Session and Threading Model](#session-and-threading-model)
+6. [Agent Prompt Composition](#agent-prompt-composition)
    - [System Prompt Structure](#system-prompt-structure)
    - [Group Chat Behavioral Prompts](#group-chat-behavioral-prompts)
    - [The Silent Reply Mechanism](#the-silent-reply-mechanism)
    - [What the LLM Sees](#what-the-llm-sees)
-6. [Outbound Pipeline](#outbound-pipeline)
+7. [Outbound Pipeline](#outbound-pipeline)
    - [Text Formatting](#text-formatting)
    - [Text Chunking](#text-chunking)
    - [Block Kit Rendering](#block-kit-rendering)
    - [Media Upload](#media-upload)
    - [Streaming](#streaming)
    - [Interactive Replies](#interactive-replies)
-7. [Agent Tool Actions](#agent-tool-actions)
-8. [Status Indicators and Reactions](#status-indicators-and-reactions)
+8. [Agent Tool Actions](#agent-tool-actions)
+9. [Status Indicators and Reactions](#status-indicators-and-reactions)
    - [Assistants API Usage](#assistants-api-usage)
    - [Typing Reactions](#typing-reactions)
    - [Status Reaction Lifecycle](#status-reaction-lifecycle)
    - [Ack Reactions](#ack-reactions)
-9. [Configuration and Multi-Account Support](#configuration-and-multi-account-support)
-   - [Account Resolution](#account-resolution)
-   - [Token Management](#token-management)
-   - [Config Options Reference](#config-options-reference)
-10. [Security Model](#security-model)
+10. [Configuration and Multi-Account Support](#configuration-and-multi-account-support)
+    - [Account Resolution](#account-resolution)
+    - [Token Management](#token-management)
+    - [Config Options Reference](#config-options-reference)
+11. [Security Model](#security-model)
     - [DM Access Control](#dm-access-control)
     - [Channel Access Control](#channel-access-control)
     - [Allowlist Matching](#allowlist-matching)
     - [Thread Context Filtering](#thread-context-filtering)
     - [Exec Approvals](#exec-approvals)
-11. [Setup and Diagnostics](#setup-and-diagnostics)
-12. [Slash Commands](#slash-commands)
-13. [Thread Ownership Plugin](#thread-ownership-plugin)
-14. [Historical Evolution](#historical-evolution)
+12. [Setup and Diagnostics](#setup-and-diagnostics)
+13. [Slash Commands](#slash-commands)
+14. [Event Handling Beyond Messages](#event-handling-beyond-messages)
+15. [Thread Ownership Plugin](#thread-ownership-plugin)
+16. [Historical Evolution](#historical-evolution)
 
 ---
 
@@ -79,7 +81,122 @@ The plugin registers via `defineChannelPluginEntry` in [`extensions/slack/index.
 
 Dependencies: `@slack/bolt` (^4.6.0) for Socket Mode and event handling, `@slack/web-api` (^7.15.0) for API calls.
 
-The manifest (`extensions/slack/openclaw.plugin.json`) declares `channels: ["slack"]` and the `package.json` metadata defines the channel as `"Slack (Socket Mode)"` with `markdownCapable: true`.
+The manifest ([`extensions/slack/openclaw.plugin.json`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/openclaw.plugin.json)) declares `channels: ["slack"]` and the `package.json` metadata defines the channel as `"Slack (Socket Mode)"` with `markdownCapable: true`.
+
+---
+
+## Channel Plugin Contract
+
+Slack is a **chat channel plugin** -- the most full-featured plugin type in the OpenClaw plugin system. It implements the [`ChannelPlugin<ResolvedAccount, Probe>`](https://github.com/openclaw/openclaw/blob/4b993ba/src/channels/plugins/types.plugin.ts#L82) contract, which is a composition of ~25 adapter slots. The Slack plugin fills virtually all of them.
+
+> **Contract definition files:**
+> [`types.plugin.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/src/channels/plugins/types.plugin.ts#L82) (top-level shape) |
+> [`types.core.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/src/channels/plugins/types.core.ts) (capabilities, messaging, threading, mentions) |
+> [`types.adapters.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/src/channels/plugins/types.adapters.ts) (config, setup, status, gateway, outbound, security, etc.)
+>
+> **Builder:** [`createChatChannelPlugin`](https://github.com/openclaw/openclaw/blob/4b993ba/src/plugin-sdk/channel-core.ts#L365) -- convenience factory that assembles the base + security + pairing + threading + outbound slots.
+>
+> **Entry point:** [`defineChannelPluginEntry`](https://github.com/openclaw/openclaw/blob/4b993ba/src/plugin-sdk/channel-core.ts#L277) -- wraps the plugin in the registration lifecycle (setRuntime, registerChannel, registerFull).
+
+### Declared Capabilities
+
+The Slack plugin declares these static capability flags in [`shared.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/shared.ts#L185):
+
+```typescript
+capabilities: {
+  chatTypes: ["direct", "channel", "thread"],
+  reactions: true,
+  threads: true,
+  media: true,
+  nativeCommands: true,
+}
+```
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `chatTypes` | `["direct", "channel", "thread"]` | Supports DMs, public/private channels, and threaded conversations |
+| `reactions` | `true` | Can add/remove emoji reactions on messages |
+| `threads` | `true` | Supports thread-scoped conversations and reply threading |
+| `media` | `true` | Can send and receive files/images/audio |
+| `nativeCommands` | `true` | Supports native channel commands (but `nativeCommandsAutoEnabled: false`) |
+| `polls` | _not set_ | No native poll support |
+| `edit` | _not set_ | Message editing is done via tool actions, not the edit capability flag |
+| `blockStreaming` | _not set_ | Block streaming uses the default behavior |
+
+### Adapter Slots Implemented
+
+The table below lists every slot of the `ChannelPlugin` contract and whether the Slack plugin implements it. All wiring is in [`channel.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/channel.ts#L299) (the `slackPlugin` export) and [`shared.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/shared.ts#L160) (the `createSlackPluginBase` factory).
+
+| Adapter slot | Implemented | Purpose | Key implementation |
+|---|---|---|---|
+| **`id`** | Yes | Channel identifier | `"slack"` |
+| **`meta`** | Yes | Display metadata (label, docs path, blurb) | `getChatChannelMeta("slack")` + `preferSessionLookupForAnnounceTarget: true` |
+| **`capabilities`** | Yes | Static capability flags | See table above |
+| **`defaults`** | -- | Queue/debounce defaults | Uses SDK defaults |
+| **`reload`** | Yes | Config hot-reload prefixes | `configPrefixes: ["channels.slack"]` |
+| **`setupWizard`** | Yes | Interactive setup wizard | [`setup-surface.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/setup-surface.ts) (token collection, allowlist, DM policy, interactive replies) |
+| **`config`** | Yes | Account resolution, inspection, allowFrom | [`slackConfigAdapter`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/shared.ts#L148) via `createScopedChannelConfigAdapter` |
+| **`configSchema`** | Yes | Zod schema + UI hints | [`config-schema.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/config-schema.ts) + [`config-ui-hints.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/config-ui-hints.ts) |
+| **`setup`** | Yes | CLI setup adapter (`--bot-token`, `--app-token`) | [`setup-core.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/setup-core.ts) |
+| **`pairing`** | Yes | DM pairing flow (challenge code, notify) | Text pairing with `normalizeAllowEntry` stripping `slack:`/`user:` prefixes |
+| **`security`** | Yes | DM policy, security warnings, audit findings | [`resolveDmPolicy`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/channel.ts#L77), [`collectWarnings`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/channel.ts#L279), [`collectAuditFindings`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/security-audit.ts#L23) |
+| **`groups`** | Yes | Per-channel mention requirement and tool policy | [`resolveSlackGroupRequireMention`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/group-policy.ts), `resolveSlackGroupToolPolicy` |
+| **`mentions`** | Yes | Mention strip patterns for `<@U...>` tags | `stripPatterns: () => ["<@[^>\\s]+>"]` |
+| **`messaging`** | Yes | Target normalization, session routing, interactive replies | Explicit target parsing, outbound session route resolution, target resolver, `enableInteractiveReplies` |
+| **`directory`** | Yes | Peer and group directory (config + live API) | [`createChannelDirectoryAdapter`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/channel.ts#L356) with config-based and live (Slack API) listing |
+| **`resolver`** | Yes | Resolve user/channel names to IDs via Slack API | [`resolveSlackChannelAllowlist`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/channel.ts#L367), `resolveSlackUserAllowlist` |
+| **`actions`** | Yes | Message tool actions (send, read, edit, react, pin, etc.) | [`createSlackActions`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/channel-actions.ts#L27) -- 13 action types |
+| **`status`** | Yes | Account status, probe, capability diagnostics | [`createComputedAccountStatusAdapter`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/channel.ts#L415) with `probeSlack` and scope inspection |
+| **`gateway`** | Yes | Start/stop per-account provider (Socket Mode or HTTP) | [`startAccount`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/channel.ts#L482) -> `monitorSlackProvider` |
+| **`allowlist`** | Yes | DM allowlist editing + group overrides + name resolution | Legacy DM allowlist adapter + scoped group overrides + Slack API name resolution |
+| **`approvalCapability`** | Yes | Native exec approval delivery via Slack messages | [`slackApprovalCapability`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/approval-native.ts#L119) -- origin + DM delivery |
+| **`commands`** | Yes | Native command config | `nativeCommandsAutoEnabled: false`, renames `status` -> `agentstatus` |
+| **`doctor`** | Yes | Diagnostic checks and legacy config migration | [`slackDoctor`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/doctor.ts#L331) -- streaming aliases, DM alias normalization, mutable allowlist warnings |
+| **`agentPrompt`** | Yes | LLM formatting hints and tool hints | Slack mrkdwn rules + interactive reply directive examples |
+| **`streaming`** | Yes | Block streaming coalesce defaults | `minChars: 1500, idleMs: 1000` |
+| **`threading`** | Yes | Reply-to mode, auto-thread ID, reply transport | Scoped account reply mode, thread tool context, auto-threading per `replyToMode` |
+| **`outbound`** | Yes | Message delivery (text, media, blocks, chunking) | `deliveryMode: "direct"`, `textChunkLimit: 8000`, send with token override, attached result sends |
+| **`auth`** | -- | _Not implemented_ | No dedicated auth adapter (auth is handled by token management) |
+| **`elevated`** | -- | _Not implemented_ | No channel-specific elevated mode |
+| **`lifecycle`** | -- | _Not implemented_ | No explicit lifecycle hooks (uses gateway start/stop) |
+| **`heartbeat`** | -- | _Not implemented_ | No Slack-specific heartbeat |
+| **`bindings`** | -- | _Not implemented_ | No binding provider |
+| **`conversationBindings`** | Auto | Conversation binding support | Set to `supportsCurrentConversationBinding: true` by `createChatChannelPlugin` |
+| **`agentTools`** | -- | _Not implemented_ | Slack tools are registered via the `actions` adapter, not as standalone agent tools |
+
+### Type Parameterization
+
+The Slack plugin is parameterized on two types:
+
+- **`ResolvedSlackAccount`** -- The resolved account object produced by [`resolveSlackAccount`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/accounts.ts#L45). Carries `accountId`, `enabled`, `name`, three tokens (bot/app/user) with their sources, `groupPolicy`, `textChunkLimit`, `mediaMaxMb`, `replyToMode`, `actions`, `slashCommand`, `dm` policy, `channels` config, and more.
+
+- **`SlackProbe`** -- The probe result from [`probeSlack`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/probe.ts#L12). Contains `ok`, `status`, `elapsedMs`, `bot: { id, name }`, `team: { id, name }`.
+
+These types flow through the generic `ChannelPlugin<ResolvedAccount, Probe>` contract so that status, security, config, and gateway adapters receive strongly typed account and probe objects.
+
+### Plugin Registration Lifecycle
+
+When the plugin is loaded, registration happens in three phases (via [`defineChannelPluginEntry`](https://github.com/openclaw/openclaw/blob/4b993ba/src/plugin-sdk/channel-core.ts#L277)):
+
+1. **`setRuntime(api.runtime)`** -- Injects the host runtime (config loader, logger, store) into the plugin via [`setSlackRuntime`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/index.ts#L4).
+2. **`api.registerChannel({ plugin })`** -- Registers the `slackPlugin` object with the channel registry. This makes all adapter slots available to core.
+3. **`registerFull(api)`** (full mode only) -- Calls [`registerSlackPluginHttpRoutes`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/http/plugin-routes.ts#L13) to register HTTP webhook routes for each configured account.
+
+In `cli-metadata` mode (used for CLI help/completions), only `registerCliMetadata` runs -- the full plugin is not loaded.
+
+### How Slack Differs from Other Channel Plugins
+
+Compared to simpler channels (e.g., a webhook-only channel), the Slack plugin is notably complex because:
+
+- **Multi-account support**: Most adapters accept an `accountId` parameter and resolve per-account config. The account model supports independent tokens, allowlists, policies, and enable/disable state per workspace.
+- **Dual connection mode**: Both Socket Mode (persistent WebSocket via Bolt) and HTTP (webhook receiver) are supported, selected per-account.
+- **Rich threading model**: Three `replyToMode` options (`off`/`first`/`all`), thread-scoped sessions, parent session inheritance, and thread participation tracking for implicit mentions.
+- **Native streaming**: Uses Slack's `ChatStreamer` API alongside a legacy draft-stream fallback, with DM-specific optimizations.
+- **Interactive replies**: Inline directive parsing (`[[slack_buttons:...]]`) compiled into Block Kit, plus auto-detection of `Options:` lines.
+- **Exec approvals**: Full native approval delivery via both origin channel and approver DMs.
+- **Status reaction lifecycle**: Multi-stage emoji lifecycle (queued -> thinking -> tool -> done/error) with configurable timing.
+- **Block Kit**: Tables, interactive blocks, and arbitrary block passthrough -- three rendering pipelines merged per reply.
+- **Assistants API**: Uses `assistant.threads.setStatus` for typing indicators.
 
 ---
 
