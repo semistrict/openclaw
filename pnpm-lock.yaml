@@ -660,12 +660,6 @@ importers:
         specifier: workspace:*
         version: link:../..
 
-  extensions/modelstudio:
-    devDependencies:
-      openclaw:
-        specifier: workspace:*
-        version: link:../..
-
   extensions/moonshot:
     devDependencies:
       openclaw:
@@ -783,6 +777,12 @@ importers:
       '@types/ws':
         specifier: ^8.18.1
         version: 8.18.1
+      openclaw:
+        specifier: workspace:*
+        version: link:../..
+
+  extensions/qwen:
+    devDependencies:
       openclaw:
         specifier: workspace:*
         version: link:../..
@@ -916,6 +916,8 @@ importers:
       openclaw:
         specifier: workspace:*
         version: link:../..
+
+  extensions/video-generation-core: {}
 
   extensions/vllm:
     devDependencies:
