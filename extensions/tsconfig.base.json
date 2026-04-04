@@ -4,8 +4,12 @@
     "baseUrl": "..",
     "paths": {
       "@openclaw/*": ["extensions/*"],
+      "@lydell/node-pty": ["src/types/lydell-node-pty.d.ts"],
       "openclaw/plugin-sdk": ["src/plugin-sdk/index.ts"],
-      "openclaw/plugin-sdk/*": ["src/plugin-sdk/*.ts"]
+      "openclaw/plugin-sdk/*": ["src/plugin-sdk/*.ts"],
+      "pdfjs-dist/legacy/build/pdf.mjs": ["src/types/pdfjs-dist-legacy.d.ts"],
+      "qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js": ["src/types/qrcode-terminal.d.ts"],
+      "qrcode-terminal/vendor/QRCode/index.js": ["src/types/qrcode-terminal.d.ts"]
     }
   }
 }

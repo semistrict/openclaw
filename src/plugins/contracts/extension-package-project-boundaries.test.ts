@@ -81,8 +81,12 @@ describe("workspace-local TypeScript project boundaries", () => {
     expect(extensionBaseTsconfig.extends).toBe("../tsconfig.base.json");
     expect(extensionBaseTsconfig.compilerOptions?.paths).toEqual({
       "@openclaw/*": ["extensions/*"],
+      "@lydell/node-pty": ["src/types/lydell-node-pty.d.ts"],
       "openclaw/plugin-sdk": ["src/plugin-sdk/index.ts"],
       "openclaw/plugin-sdk/*": ["src/plugin-sdk/*.ts"],
+      "pdfjs-dist/legacy/build/pdf.mjs": ["src/types/pdfjs-dist-legacy.d.ts"],
+      "qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js": ["src/types/qrcode-terminal.d.ts"],
+      "qrcode-terminal/vendor/QRCode/index.js": ["src/types/qrcode-terminal.d.ts"],
     });
   });
 
