@@ -3,6 +3,7 @@
   "compilerOptions": {
     "baseUrl": "..",
     "paths": {
+      "@openclaw/*": ["extensions/*"],
       "openclaw/plugin-sdk": ["src/plugin-sdk/index.ts"],
       "openclaw/plugin-sdk/*": ["src/plugin-sdk/*.ts"]
     }

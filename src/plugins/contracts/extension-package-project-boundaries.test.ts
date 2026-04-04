@@ -80,6 +80,7 @@ describe("workspace-local TypeScript project boundaries", () => {
     const extensionBaseTsconfig = readTsConfig("extensions/tsconfig.base.json");
     expect(extensionBaseTsconfig.extends).toBe("../tsconfig.base.json");
     expect(extensionBaseTsconfig.compilerOptions?.paths).toEqual({
+      "@openclaw/*": ["extensions/*"],
       "openclaw/plugin-sdk": ["src/plugin-sdk/index.ts"],
       "openclaw/plugin-sdk/*": ["src/plugin-sdk/*.ts"],
     });
