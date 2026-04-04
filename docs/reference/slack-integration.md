@@ -21,8 +21,10 @@ This document describes every aspect of how OpenClaw interacts with Slack: from 
 
 1. [Plugin Architecture](#plugin-architecture)
 2. [Channel Plugin Contract](#channel-plugin-contract)
-3. [Connection Modes](#connection-modes)
-4. [Inbound Pipeline](#inbound-pipeline)
+3. [Slack vs. Discord](#slack-vs-discord)
+4. [Slack-Unique Features in Depth](#slack-unique-features-in-depth)
+5. [Connection Modes](#connection-modes)
+6. [Inbound Pipeline](#inbound-pipeline)
    - [Event Registration](#event-registration)
    - [Deduplication and Race Handling](#deduplication-and-race-handling)
    - [Debouncing](#debouncing)
@@ -31,40 +33,40 @@ This document describes every aspect of how OpenClaw interacts with Slack: from 
    - [Content Resolution](#content-resolution)
    - [Thread Context Assembly](#thread-context-assembly)
    - [Context Payload Assembly](#context-payload-assembly)
-5. [Session and Threading Model](#session-and-threading-model)
-6. [Agent Prompt Composition](#agent-prompt-composition)
+7. [Session and Threading Model](#session-and-threading-model)
+8. [Agent Prompt Composition](#agent-prompt-composition)
    - [System Prompt Structure](#system-prompt-structure)
    - [Group Chat Behavioral Prompts](#group-chat-behavioral-prompts)
    - [The Silent Reply Mechanism](#the-silent-reply-mechanism)
    - [What the LLM Sees](#what-the-llm-sees)
-7. [Outbound Pipeline](#outbound-pipeline)
+9. [Outbound Pipeline](#outbound-pipeline)
    - [Text Formatting](#text-formatting)
    - [Text Chunking](#text-chunking)
    - [Block Kit Rendering](#block-kit-rendering)
    - [Media Upload](#media-upload)
    - [Streaming](#streaming)
    - [Interactive Replies](#interactive-replies)
-8. [Agent Tool Actions](#agent-tool-actions)
-9. [Status Indicators and Reactions](#status-indicators-and-reactions)
+10. [Agent Tool Actions](#agent-tool-actions)
+11. [Status Indicators and Reactions](#status-indicators-and-reactions)
    - [Assistants API Usage](#assistants-api-usage)
    - [Typing Reactions](#typing-reactions)
    - [Status Reaction Lifecycle](#status-reaction-lifecycle)
    - [Ack Reactions](#ack-reactions)
-10. [Configuration and Multi-Account Support](#configuration-and-multi-account-support)
+12. [Configuration and Multi-Account Support](#configuration-and-multi-account-support)
     - [Account Resolution](#account-resolution)
     - [Token Management](#token-management)
     - [Config Options Reference](#config-options-reference)
-11. [Security Model](#security-model)
+13. [Security Model](#security-model)
     - [DM Access Control](#dm-access-control)
     - [Channel Access Control](#channel-access-control)
     - [Allowlist Matching](#allowlist-matching)
     - [Thread Context Filtering](#thread-context-filtering)
     - [Exec Approvals](#exec-approvals)
-12. [Setup and Diagnostics](#setup-and-diagnostics)
-13. [Slash Commands](#slash-commands)
-14. [Event Handling Beyond Messages](#event-handling-beyond-messages)
-15. [Thread Ownership Plugin](#thread-ownership-plugin)
-16. [Historical Evolution](#historical-evolution)
+14. [Setup and Diagnostics](#setup-and-diagnostics)
+15. [Slash Commands](#slash-commands)
+16. [Event Handling Beyond Messages](#event-handling-beyond-messages)
+17. [Thread Ownership Plugin](#thread-ownership-plugin)
+18. [Historical Evolution](#historical-evolution)
 
 ---
 
@@ -229,6 +231,219 @@ The following table compares advanced feature support across the top channels. T
 - **Production codebase size**: Discord (36K LOC) and Telegram (27K LOC) are substantially larger than Slack (17K LOC), primarily due to more complex gateway/bot lifecycle code, richer embed/formatting systems, and Discord's voice/forum channel support
 - **Adapter slot count**: Discord and Telegram each fill 25 slots vs. Slack's 24 (both implement the `elevated` adapter which Slack does not)
 - **Draft streaming depth**: Telegram has the most files (12) dedicated to draft/preview streaming, with sophisticated edit-based preview UX
+
+---
+
+## Slack vs. Discord
+
+Discord is the closest peer to Slack in this codebase -- same adapter slot tier, same feature categories, but different platform constraints lead to very different implementation choices.
+
+> **Discord key files:**
+> [`extensions/discord/src/channel.ts`](https://github.com/openclaw/openclaw/tree/4b993ba/extensions/discord/src/channel.ts) |
+> [`extensions/discord/src/shared.ts`](https://github.com/openclaw/openclaw/tree/4b993ba/extensions/discord/src/shared.ts) |
+> [`extensions/discord/src/monitor/`](https://github.com/openclaw/openclaw/tree/4b993ba/extensions/discord/src/monitor)
+
+### Connection Model
+
+| | Slack | Discord |
+|---|---|---|
+| **Primary connection** | Socket Mode (Bolt `App` with `socketMode: true`) | WebSocket Gateway (`@buape/carbon/gateway`) |
+| **Alternative** | HTTP webhook receiver with signing secret | None (gateway only) |
+| **Library** | `@slack/bolt` + `@slack/web-api` | `@buape/carbon` + `@buape/carbon/gateway` |
+| **Reconnection** | Exponential backoff (2s-30s, 1.8x, 12 max attempts) | Gateway supervisor with restart logic |
+| **Multi-account startup** | Parallel | Staggered (10s between accounts) to avoid Discord rate limits |
+| **Intents/scopes** | OAuth scopes (`assistant:write`, `chat:write`, etc.) | Gateway intents (`Guilds`, `MessageContent`, `GuildVoiceStates`, etc.) |
+
+### Message Limits and Formatting
+
+| | Slack | Discord |
+|---|---|---|
+| **Text limit** | 8,000 chars | 2,000 chars |
+| **Markup format** | Slack mrkdwn (bold: `*text*`, links: `<url\|label>`) | Standard Markdown |
+| **Chunking** | IR-based splitting at node boundaries | Fence-aware splitting with italic rebalancing |
+| **Structured UI** | Block Kit (sections, tables, actions) | Components V2 (containers, sections, media galleries) |
+| **Tables** | Native `type: "table"` block with ASCII fallback | Markdown table conversion |
+
+### Streaming
+
+| | Slack | Discord |
+|---|---|---|
+| **Native streaming** | Yes -- `ChatStreamer` API (`startStream`/`appendStream`/`stopStream`) | No |
+| **Draft streaming** | Yes -- message edit loop, 1000ms throttle, 8000 char cap | Yes -- message edit loop, 1200ms throttle, 2000 char cap |
+| **Streaming modes** | `off` / `partial` (native) / `block` / `progress` | `off` / `partial` (edit) / `block` |
+| **DM optimization** | Skips preview for DMs without thread | `minInitialChars` debounce for push notification quality |
+
+### Threading
+
+| | Slack | Discord |
+|---|---|---|
+| **Thread model** | Parent message + replies (flat threads) | Public/private threads, forums, media channels, announcement threads |
+| **Auto-thread creation** | Via `replyToMode: "all"` (messages become thread parents) | Configurable per channel, with AI-generated thread titles |
+| **Thread bindings** | None | Full subagent-to-thread binding with webhook personas, idle timeout, farewell messages |
+| **Implicit mention** | Bot participation in thread = implicit mention | Similar via sent-thread tracking |
+| **Session inheritance** | `thread.inheritParent` config | Parent session key tracked per thread |
+
+### Interactive Components
+
+| | Slack | Discord |
+|---|---|---|
+| **Buttons** | Yes -- Block Kit buttons, max 5 per row | Yes -- action row buttons, max 5 per row, plus per-user allowlists |
+| **Selects** | Yes -- static select, max 100 options | Yes -- string/user/role/mentionable/channel selects |
+| **Modals/Forms** | Block Kit modal views (via `view_submission`) | Native modals with text inputs, checkboxes, radio groups, selects |
+| **Inline directives** | `[[slack_buttons:...]]`, `[[slack_select:...]]`, auto-detected `Options:` | Rendered from generic `InteractiveReply` model |
+| **Rich containers** | Block Kit sections/dividers/context | Components V2 containers with accent colors, thumbnails, media galleries |
+
+### Tool Actions
+
+| Category | Slack | Discord |
+|---|---|---|
+| **Core messaging** | send, read, edit, delete, upload-file, download-file | send, read, edit, delete |
+| **Reactions/emoji** | react, reactions, emoji-list | react, reactions, emoji-list, emoji-upload, sticker, sticker-upload |
+| **Pins** | pin, unpin, list-pins | pin, unpin, list-pins |
+| **Threads** | (handled via session/replyToMode) | thread-create, thread-list, thread-reply |
+| **Search** | (not a tool action) | search |
+| **Channel management** | -- | channel-info, channel-list, channel-create, channel-edit, channel-delete, channel-move, category-create/edit/delete |
+| **Member/role** | member-info | member-info, role-info, role-add, role-remove |
+| **Moderation** | -- | timeout, kick, ban |
+| **Voice** | -- | voice-status |
+| **Events** | -- | event-list, event-create |
+| **Polls** | -- | poll |
+| **Presence** | -- | set-presence |
+
+Discord has **~35 tool actions** vs. Slack's **~13**. Discord's guild model (channels, categories, roles, moderation) creates a much larger action surface.
+
+### Platform-Specific Features
+
+| Feature | Slack | Discord |
+|---|---|---|
+| **Assistants API** | `assistant.threads.setStatus` for typing indicators | -- |
+| **Block Kit tables** | Native `type: "table"` block | -- |
+| **HTTP webhook mode** | Full dual-mode support | -- |
+| **Voice channels** | -- | Join, listen, transcribe, TTS with session management |
+| **Forum channels** | -- | Dedicated thread-based forum handling |
+| **Auto-presence** | -- | Bot status reflects health (healthy/degraded/exhausted) |
+| **PluralKit** | -- | Recognizes proxy bot messages |
+| **Model picker** | -- | Native button/select UI with pagination |
+| **Subagent personas** | -- | Thread bindings with per-subagent webhook identity |
+
+### Security Model
+
+Both use similar layered security:
+- **DM access**: allowlist/pairing/open/disabled policies
+- **Channel access**: allowlist-based with per-channel user restrictions
+- **Command authorization**: owner allowlist + per-channel user gates
+- **Exec approvals**: native interactive delivery to origin or approver DMs
+
+Discord adds **hierarchical allowlists** (guild > channel > user granularity), more granular than Slack's workspace-flat model.
+
+---
+
+## Slack-Unique Features in Depth
+
+These features exist only in the Slack channel plugin -- no other channel in the repo implements them.
+
+### Native Streaming via ChatStreamer API
+
+> [`extensions/slack/src/streaming.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/streaming.ts) |
+> [`extensions/slack/src/stream-mode.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/stream-mode.ts)
+
+Slack's `ChatStreamer` SDK provides a platform-native streaming UX where the message updates word-by-word in the Slack client, matching Slack's "Agents & AI Apps" pattern.
+
+**Three lifecycle functions:**
+- **`startSlackStream`** -- Creates a `ChatStreamer` via `client.chatStream()` with channel, thread_ts, and optionally team_id/user_id (user_id required for DM streaming). Initial text is appended via `streamer.append({ markdown_text })`.
+- **`appendSlackStream`** -- Appends markdown text to the active stream. No-ops if stopped or empty.
+- **`stopSlackStream`** -- Finalizes the stream with optional final text. The streamed message becomes a normal Slack message.
+
+**Mode selection cascade:**
+
+| Config | Result |
+|---|---|
+| `streaming: "partial"` + `nativeStreaming: true` (default) | Native ChatStreamer |
+| `streaming: "partial"` + `nativeStreaming: false` | Draft stream, "replace" mode (edit-in-place) |
+| `streaming: "block"` | Draft stream, "append" mode (cumulative) |
+| `streaming: "progress"` | Draft stream, "status_final" mode (animated "thinking..." dots) |
+| `streaming: "off"` | No streaming |
+
+**Fallback behavior:** During native streaming, if the stream fails, or the payload has media/blocks/no text, the dispatch falls back to normal message posting. The `streamFailed` flag ensures all subsequent payloads also fall back. Legacy `streamMode` config values (`replace`/`status_final`/`append`) are auto-mapped.
+
+**Draft stream fallback** ([`draft-stream.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/draft-stream.ts#L18)): Throttled edit loop (default 1000ms, min 250ms). Sends first chunk as new message, edits the same message on updates. Max 8000 chars. `forceNewMessage()` resets state at assistant message boundaries. The `status_final` variant shows animated dots (`"Status: thinking."` / `".."` / `"..."`) and posts the final answer as a separate message.
+
+**Preview finalization:** When draft streaming was used, the dispatch attempts to edit the draft in-place to become the final reply (avoiding a duplicate message). If the edit fails, a readback verification checks whether it actually applied before falling back.
+
+### Assistants API Thread Status
+
+> [`extensions/slack/src/monitor/context.ts:255`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/monitor/context.ts#L255)
+
+The only channel plugin using a platform-provided typing status API. Calls `assistant.threads.setStatus` with `{ channel_id, thread_ts, status }` via two resolution paths:
+1. `client.assistant.threads.setStatus(payload)` (typed SDK method)
+2. `client.apiCall("assistant.threads.setStatus", payload)` (raw fallback)
+
+**OAuth scope:** `assistant:write`
+
+**Lifecycle:** Called twice per message:
+1. **Start:** Sets `status: "is typing..."` when agent begins processing
+2. **Stop:** Sets `status: ""` (clears) when agent finishes
+
+Only works in threaded conversations (no-ops if `threadTs` is falsy). Failures are logged but never thrown -- best-effort. Shows as a status indicator below the bot's name in Slack's thread panel.
+
+### Block Kit Rendering (Three Merged Pipelines)
+
+> [`block-kit-tables.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/block-kit-tables.ts) |
+> [`blocks-render.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/blocks-render.ts) |
+> [`blocks-input.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/blocks-input.ts) |
+> [`reply-blocks.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/reply-blocks.ts)
+
+Three independent pipelines produce Block Kit output, merged at delivery time:
+
+**Pipeline 1 -- Table blocks** (`block-kit-tables.ts`): Converts parsed Markdown tables into Slack's native `type: "table"` block with `column_settings` and `raw_text` cells. Limits: 20 columns, 100 rows. Includes a pipe-delimited ASCII fallback (80-char cells, 4000-char total). Tables go into `attachments`, not `blocks`.
+
+**Pipeline 2 -- Interactive blocks** (`blocks-render.ts`): Converts the generic `InteractiveReply` model into Block Kit:
+- Text -> `section` blocks (max 3000 chars)
+- Buttons -> `actions` blocks with `openclaw:reply_button:{row}:{col}` action IDs, max 75-char labels
+- Selects -> `actions` blocks with `openclaw:reply_select:{row}` action IDs, 75-char option labels
+
+**Pipeline 3 -- Arbitrary tool blocks** (`blocks-input.ts`): Validates raw Block Kit JSON from `channelData.slack.blocks`. Max 50 blocks, each must have a string `type`.
+
+**Merge** (`reply-blocks.ts`): `resolveSlackReplyBlocks` concatenates channel blocks first, then interactive blocks. Combined total must not exceed 50. Table blocks are separate (via `attachments`).
+
+### Dual Connection Mode (Socket + HTTP)
+
+> [`extensions/slack/src/monitor/provider.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/monitor/provider.ts) |
+> [`extensions/slack/src/http/plugin-routes.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/http/plugin-routes.ts)
+
+No other channel supports two connection modes. Selection: `account.config.mode ?? "socket"`.
+
+**Socket mode** requires `botToken` + `appToken`. Uses Bolt's `socketMode: true` with a full reconnect loop (exponential backoff, max 12 attempts, non-recoverable auth errors stop permanently). Validates that the app token's embedded API app ID matches the bot's.
+
+**HTTP mode** requires `botToken` + `signingSecret`. Uses Bolt's `HTTPReceiver` with Slack's HMAC-SHA256 request verification. Request guards: 1 MB body limit, 30s timeout. Each account gets its own webhook path (default `/slack/events`). After setup, the provider awaits the abort signal -- no reconnect loop needed.
+
+### Interactive Reply Directive Syntax
+
+> [`extensions/slack/src/interactive-replies.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/interactive-replies.ts#L177)
+
+The LLM can embed structured UI directives directly in reply text. Two detection mechanisms:
+
+**1. Explicit directives** -- Regex: `\[\[(slack_buttons|slack_select):\s*([^\]]+)\]\]`
+
+```
+[[slack_buttons: Yes:yes:primary, No:no:danger, Maybe:maybe]]
+[[slack_select: Pick a color | Red:red, Blue:blue, Green:green]]
+```
+
+- **Buttons:** `[[slack_buttons: label:value:style, ...]]` -- max 5 items, styles: `primary`/`secondary`/`success`/`danger`
+- **Selects:** `[[slack_select: placeholder | label:value, ...]]` -- max 100 options, `|` separates placeholder from options
+
+Directives are stripped from visible text. Text between directives becomes `text` blocks.
+
+**2. Auto-detection** -- If no directives found, checks the last line for `Options: foo, bar, baz`:
+- Must have 2-12 items, alphanumeric, unique
+- <=5 items -> buttons
+- 6-12 items -> select dropdown
+- The `Options:` line is removed from visible text
+
+**Incoming interactions:** Button clicks and select choices arrive as `block_actions` events. The handler acks immediately, authorizes the sender, dispatches to plugin handlers, or enqueues as a system event. The original message is updated to show a confirmation (`"Selected Label" selected by @user`). Interaction payloads are sanitized (max 2400 chars, sensitive keys redacted).
+
+Requires `capabilities.interactiveReplies: true` per account.
 
 ---
 
