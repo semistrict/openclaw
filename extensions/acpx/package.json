@@ -6,6 +6,9 @@
   "dependencies": {
     "acpx": "0.4.1"
   },
+  "devDependencies": {
+    "openclaw": "workspace:*"
+  },
   "openclaw": {
     "extensions": [
       "./index.ts"
