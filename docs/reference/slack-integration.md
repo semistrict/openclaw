@@ -25,6 +25,7 @@ This document describes every aspect of how OpenClaw interacts with Slack: from 
 4. [Slack-Unique Features in Depth](#slack-unique-features-in-depth)
 5. [Connection Modes](#connection-modes)
 6. [Inbound Pipeline](#inbound-pipeline)
+
    - [Event Registration](#event-registration)
    - [Deduplication and Race Handling](#deduplication-and-race-handling)
    - [Debouncing](#debouncing)
@@ -380,7 +381,9 @@ Three independent pipelines produce Block Kit output, merged at delivery time:
 
 No other channel supports two connection modes. Selection: `account.config.mode ?? "socket"`.
 
-**Socket mode** requires `botToken` + `appToken`. Uses Bolt's `socketMode: true` with a full reconnect loop (exponential backoff, max 12 attempts, non-recoverable auth errors stop permanently). Validates that the app token's embedded API app ID matches the bot's.
+**Socket mode** requires `botToken` + `appToken`. Uses Bolt's `socketMode: true` with a full reconnect loop. Validates that the app token's embedded API app ID matches the bot's.
+
+Reconnection policy (defined in [`reconnect-policy.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/monitor/reconnect-policy.ts#L4)): non-recoverable auth errors (invalid token, revoked app) stop permanently. Transient errors use exponential backoff: 2s initial, 30s max, 1.8x factor, 25% jitter, 12 max attempts.
 
 **HTTP mode** requires `botToken` + `signingSecret`. Uses Bolt's `HTTPReceiver` with Slack's HMAC-SHA256 request verification. Request guards: 1 MB body limit, 30s timeout. Each account gets its own webhook path (default `/slack/events`). After setup, the provider awaits the abort signal -- no reconnect loop needed.
 
@@ -416,28 +419,12 @@ Requires `capabilities.interactiveReplies: true` per account.
 
 ## Connection Modes
 
-Slack is the only channel plugin supporting two connection modes. See also [Dual Connection Mode](#dual-connection-mode-socket--http) for the comparative context.
+Slack supports **Socket Mode** (default, persistent WebSocket) and **HTTP Mode** (webhook receiver). See [Dual Connection Mode (Socket + HTTP)](#dual-connection-mode-socket--http) for token requirements, reconnection policy, and implementation details.
 
-### Socket Mode (Default)
+**Additional Socket Mode details** not covered in the unique features section:
 
-Uses `@slack/bolt`'s `App` class with `socketMode: true`. The gateway's [`monitorSlackProvider()`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/monitor/provider.ts) starts a Bolt app with bot token + app-level token, handles connection lifecycle, and publishes connected/disconnected status.
-
-The `@slack/bolt` import uses a hardened interop resolver (`resolveSlackBoltInterop`) that tries multiple resolution strategies (direct module, nested default, namespace default, constructor detection) to handle Bun vs. Node ESM vs. CJS differences. This was added after Node 25.x compatibility issues.
-
-**Reconnection policy** (defined in [`reconnect-policy.ts`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/monitor/reconnect-policy.ts#L4)): On non-recoverable auth errors (invalid token, revoked app), the provider stops permanently. On transient errors, exponential backoff with these parameters:
-- Initial delay: 2 seconds
-- Max delay: 30 seconds
-- Backoff factor: 1.8x
-- Jitter: 25%
-- Max attempts: 12
-
-Uses `sleepWithAbort` for clean cancellation on shutdown. [`gracefulStopSlackApp`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/monitor/provider.ts#L192) pre-sets `shuttingDown = true` on the internal `SocketModeClient` before calling `stop()` to prevent orphaned ping intervals from firing reconnects during shutdown.
-
-### HTTP Mode
-
-Registers webhook routes via [`registerSlackPluginHttpRoutes()`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/http/plugin-routes.ts#L13). Each account gets its own webhook path (configurable via `webhookPath`). Incoming events are validated with a signing secret instead of an app token. The HTTP receiver (`HTTPReceiver` from `@slack/bolt`) handles Slack's request verification.
-
-Request body limits: 1 MB max body, 30-second body timeout. An `installRequestBodyLimitGuard` middleware prevents oversized payloads.
+- The `@slack/bolt` import uses a hardened interop resolver (`resolveSlackBoltInterop`) that tries multiple resolution strategies (direct module, nested default, namespace default, constructor detection) to handle Bun vs. Node ESM vs. CJS differences. This was added after Node 25.x compatibility issues.
+- [`gracefulStopSlackApp`](https://github.com/openclaw/openclaw/blob/4b993ba/extensions/slack/src/monitor/provider.ts#L192) pre-sets `shuttingDown = true` on the internal `SocketModeClient` before calling `stop()` to prevent orphaned ping intervals from firing reconnects during shutdown.
 
 ---
 
@@ -960,7 +947,7 @@ All paths below are relative to `channels.slack` (or `channels.slack.accounts.<i
 | `channels.<id>.skills` | `string[]` | -- | Per-channel skill command filter |
 | `channels.<id>.systemPrompt` | `string` | -- | Per-channel system prompt |
 | `replyToMode` | `"off"` / `"first"` / `"all"` | varies | Threading behavior |
-| `streaming` | `"off"` / `"partial"` / `"block"` / `"progress"` | `"off"` | Streaming mode |
+| `streaming` | `"off"` / `"partial"` / `"block"` / `"progress"` | `"partial"` | Streaming mode |
 | `nativeStreaming` | `boolean` | `true` (when `streaming=partial`) | Use Slack ChatStreamer API |
 | `capabilities.interactiveReplies` | `boolean` | `false` | Enable inline interactive directives |
 | `actions.reactions` | `boolean` | `true` | Enable reaction tool actions |
@@ -991,7 +978,7 @@ All paths below are relative to `channels.slack` (or `channels.slack.accounts.<i
 
 ### DM Access Control
 
-Three DM policies (`dm.policy` / `dmPolicy`):
+Three DM policies (`dmPolicy`):
 
 - **`pairing`** (default): Unknown senders receive a pairing challenge code. Once paired, the user is added to the dynamic allowlist. Pairing codes are issued via `createChannelPairingChallengeIssuer`.
 - **`open`**: All DMs accepted.
