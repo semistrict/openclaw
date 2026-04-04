@@ -17,6 +17,7 @@ export const unitTestIncludePatterns = [
 ];
 
 export const boundaryTestFiles = [
+  "test/extension-boundary-breakage-report.test.ts",
   "src/infra/boundary-path.test.ts",
   "src/infra/git-root.test.ts",
   "src/infra/home-dir.test.ts",
