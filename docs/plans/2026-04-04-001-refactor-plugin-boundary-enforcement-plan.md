@@ -4,6 +4,7 @@ type: refactor
 status: active
 date: 2026-04-04
 origin: docs/brainstorms/2026-04-04-plugin-boundary-enforcement-requirements.md
+deepened: 2026-04-04
 ---
 
 # refactor: Enforce bundled plugin package boundaries
@@ -373,20 +374,48 @@ contract instead of root source aliases.
 
 **Approach:**
 
-- Add `openclaw` as the explicit workspace development dependency for bundled
-  plugin packages so editor and typechecker resolution is anchored in package
-  metadata rather than repo visibility.
+- Normalize bundled plugin package metadata around one explicit development
+  contract:
+  - `openclaw` lives in `devDependencies` as `workspace:*`
+  - `openclaw` must not appear in `dependencies` or `optionalDependencies`
+  - `peerDependencies` remain optional package-public metadata for plugins that
+    are actually installed outside the monorepo, but peer metadata must not be
+    the thing that makes local workspace development resolve
+- Resolve extension-local typechecking through the `openclaw` workspace package
+  plus a project reference to the narrowed root `tsconfig.json`, so editor and
+  compiler resolution are anchored in package metadata rather than repo
+  visibility.
 - Remove extension reliance on the root `@openclaw/*` alias and the direct
   `paths -> src/plugin-sdk/*.ts` escape hatch once project references provide a
   supported resolution path.
 - Keep published npm/package behavior anchored on `package.json` `exports`; this
   unit changes workspace/editor resolution, not the public package shape.
-- Extend package-contract tests so missing or misconfigured extension package
-  metadata fails loudly.
+- Extend package-contract tests so the following fail loudly:
+  - missing `openclaw` workspace dev dependency
+  - illegal placement of `openclaw` under runtime dependency fields
+  - extension-local resolution that only succeeds because prebuilt `dist/`
+    artifacts are present
+  - drift between local workspace resolution and packed-publish resolution
+
+**Technical design:** _(directional guidance, not implementation specification)_
+
+Use the root `openclaw` package as the single host contract in development and
+publish time:
+
+1. Extension package project references narrowed root `tsconfig.json`
+2. Extension `package.json` declares `openclaw` in `devDependencies`
+3. TypeScript/editor resolution reaches `openclaw/plugin-sdk/*` through the
+   workspace package and project graph
+4. `package.json` `exports` remains the publish-time truth for external
+   consumers
+5. Any attempt to resolve sibling bundled packages or repo `src/**` fails
+   because there is no longer an alias-based escape hatch
 
 **Patterns to follow:**
 
 - `package.json`
+- `extensions/googlechat/package.json`
+- `extensions/matrix/package.json`
 - `src/plugin-sdk/entrypoints.ts`
 - `src/plugins/contracts/plugin-sdk-package-contract-guardrails.test.ts`
 
@@ -395,16 +424,28 @@ contract instead of root source aliases.
 - Happy path: a bundled plugin package resolves
   `openclaw/plugin-sdk/provider-entry` and other public SDK subpaths through
   workspace package resolution.
+- Happy path: an extension package with the normalized `devDependencies` shape
+  typechecks from a clean workspace checkout without needing a prebuilt
+  `dist/plugin-sdk/*.d.ts` tree.
 - Edge case: imports to `@openclaw/<other-plugin>` or sibling extension source
   files remain unresolved from bundled plugin production code.
+- Edge case: a package that places `openclaw` under `dependencies` or
+  `optionalDependencies` fails the package-contract guard because that would
+  blur runtime packaging and development resolution.
 - Error path: an extension package that omits the required `openclaw`
   development dependency fails the contract guard.
+- Error path: a workspace setup where extension resolution succeeds only because
+  stale built artifacts exist fails a clean-tree contract check.
 - Integration: package/pack checks still expose the same published
   `openclaw/plugin-sdk/*` surface to external consumers.
+- Integration: local workspace resolution and `npm pack` resolution agree on the
+  allowed SDK subpaths, so an import that typechecks locally is not silently
+  relying on a different publish-time module graph.
 
 **Verification:**
 
-- Bundled plugin development no longer depends on repo-local source aliasing.
+- Bundled plugin development no longer depends on repo-local source aliasing or
+  incidental prebuilt artifacts.
 - The root package still publishes the same SDK contract to external consumers.
 
 - [ ] **Unit 3: Freeze plugin-specific SDK debt and codify subpath policy**
