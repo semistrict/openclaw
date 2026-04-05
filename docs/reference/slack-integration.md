@@ -1078,6 +1078,25 @@ Discord's codebase is 2x larger, driven primarily by voice/forum channel support
 | **Implicit mention** | Bot participation in thread = implicit mention | Similar via sent-thread tracking |
 | **Session inheritance** | `thread.inheritParent` config | Parent session key tracked per thread |
 
+### Threading Model: Slack vs. Discord vs. Telegram
+
+All three channel plugins share the same core session routing infrastructure ([`resolveAgentRoute`](https://github.com/openclaw/openclaw/blob/4b993ba/src/routing/resolve-route.ts#L631) + [`resolveThreadSessionKeys`](https://github.com/openclaw/openclaw/blob/4b993ba/src/routing/session-key.ts#L234) + `buildAgentPeerSessionKey`), but diverge significantly in how platform threads map to agent sessions.
+
+| | Slack | Discord | Telegram |
+|---|---|---|---|
+| **Thread primitive** | Parent message + replies (flat, identified by `thread_ts`) | Platform threads (public/private), forum posts, media channel posts | Forum topics (identified by `message_thread_id`) |
+| **Session key for threads** | Base key + `:thread:<thread_ts>` only for actual thread replies | Thread/channel ID IS the conversation ID (threads are first-class) | Topic embedded in peer ID: `<chatId>:topic:<topicId>` | 
+| **Thread = new conversation?** | No -- threads fork from the channel session | Yes -- each thread has its own session key | Partially -- forum topics yes, non-forum reply threads ignored |
+| **Forum/topic support** | None | Full (forums, media channels, announcement threads) | Full (`isForum` flag, topic-scoped sessions) |
+| **Topic-bound agents** | N/A | Via thread bindings (subagent webhook personas) | Via `topicAgentId` -- each topic can route to a different agent |
+| **Thread participation tracking** | `sent-thread-cache` (24h TTL, 5000 entries) for implicit mention | Similar | Uses reply-to relationships instead |
+| **DM threads** | `replyToMode=all` creates threads from each message | No DM threading | `dmThreadId` creates session isolation per DM topic |
+| **Auto-thread creation** | Via `replyToMode` (replies become thread parents) | Per-channel `autoThread` with AI-generated titles | N/A (topics are pre-created in forums) |
+| **Non-forum reply threads** | Full session fork | Full session fork | Explicitly ignored (`!isForum` -> skip `message_thread_id`) |
+| **Parent session** | `thread.inheritParent` -> `parentSessionKey` | `parentConversationId` -> `parentPeer` | `parentConversationCandidates: [chatId]` (base chat is always parent) |
+
+**The fundamental difference:** Slack treats threads as session forks from a channel. Discord treats threads as first-class conversations (they get their own channel IDs from the Discord API). Telegram treats forum topics as the conversation unit while ignoring non-forum reply threads entirely.
+
 ### Interactive Components
 
 | | Slack | Discord |
